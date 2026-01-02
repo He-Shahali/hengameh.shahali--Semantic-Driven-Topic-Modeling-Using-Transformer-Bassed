@@ -1,0 +1,185 @@
+# نصب پکیج‌ها
+# pip install sentence-transformers scikit-learn pandas numpy hdbscan umap-learn datasets
+
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+import hdbscan
+import umap
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+from datasets import load_dataset
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# بارگذاری داده‌ها از AG News
+print("Loading data...")
+dataset = load_dataset("ag_news", split="train[:500]")
+documents = dataset["text"]
+true_labels = dataset["label"]
+
+print(f"Data loaded: {len(documents)} documents")
+
+# کلاس برای مدل Semantic Topic Modeling با DBSCAN و UMAP
+class SemanticTopicModelDBSCAN:
+    def __init__(self, n_topics=3, embedding_model='all-MiniLM-L6-v2', min_cluster_size=10, umap_dim=5):
+        self.n_topics = n_topics
+        self.model = SentenceTransformer(embedding_model)
+        self.vectorizer = CountVectorizer(stop_words='english', max_features=1000)
+
+        # مدل UMAP برای کاهش ابعاد
+        self.umap_model = umap.UMAP(
+            n_neighbors=15,
+            n_components=umap_dim,
+            metric="cosine",
+            random_state=42
+        )
+
+        # خوشه‌بندی با DBSCAN
+        self.clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            metric="euclidean",
+            cluster_selection_method="eom"
+        )
+
+    def fit_transform(self, docs):
+        print("1. Generating Embeddings...")
+        self.doc_embeddings = self.model.encode(docs, show_progress_bar=False)
+
+        print("2. Reducing Dimensions with UMAP...")
+        self.embeddings_umap = self.umap_model.fit_transform(self.doc_embeddings)
+
+        print("3. Clustering with DBSCAN...")
+        self.labels = self.clusterer.fit_predict(self.embeddings_umap)
+
+        n_clusters = len(set(self.labels)) - (1 if -1 in self.labels else 0)
+        print(f"Clusters found (excluding noise): {n_clusters}")
+
+        print("4. Semantic topic extraction...")
+        return self._extract_topics(docs)
+
+    def _extract_topics(self, docs, top_n=10):
+        vocab = self.vectorizer.fit(docs).get_feature_names_out()
+        word_embeddings = self.model.encode(vocab, show_progress_bar=False)
+
+        topics = {}
+        for label in set(self.labels):
+            if label == -1:
+                continue
+
+            idx = np.where(self.labels == label)[0]
+            center = np.mean(self.doc_embeddings[idx], axis=0)
+
+            sims = cosine_similarity([center], word_embeddings)[0]
+            top_words = [vocab[i] for i in sims.argsort()[-top_n:][::-1]]
+
+            topics[f"Topic {label}"] = top_words
+
+        return topics
+
+# مدل LDA برای مقایسه
+def run_lda_baseline(docs, n_topics=3):
+    print("Running LDA Baseline...")
+    vectorizer = CountVectorizer(stop_words='english', max_features=1000)
+    X = vectorizer.fit_transform(docs)
+    lda = LatentDirichletAllocation(n_components=n_topics, random_state=42)
+    lda.fit(X)
+
+    topics = {}
+    feature_names = vectorizer.get_feature_names_out()
+    for topic_idx, topic in enumerate(lda.components_):
+        top_words = [feature_names[i] for i in topic.argsort()[:-11:-1]]
+        topics[f"Topic {topic_idx+1}"] = top_words
+    return topics
+
+# ارزیابی Coherence
+def calculate_semantic_coherence(topics_dict, model):
+    scores = []
+    for topic, words in topics_dict.items():
+        if not words: continue
+        embeddings = model.encode(words)
+        sim_matrix = cosine_similarity(embeddings)
+   
+        avg_sim = (np.sum(sim_matrix) - len(words)) / (len(words) * (len(words)-1))
+        scores.append(avg_sim)
+    return np.mean(scores)
+
+# اجرای مدل‌ها
+stm_dbscan = SemanticTopicModelDBSCAN(n_topics=3, min_cluster_size=25)
+dbscan_topics = stm_dbscan.fit_transform(documents)
+
+lda_topics = run_lda_baseline(documents, n_topics=3)
+
+# نمایش نتایج
+print("\n" + "="*50)
+print("نتایج روش مقاله (Semantic-Driven):")
+print("="*50)
+for topic, words in dbscan_topics.items():
+    print(f"{topic}: {', '.join(words)}")
+
+print("\n" + "="*50)
+print("نتایج روش سنتی (LDA):")
+print("="*50)
+for topic, words in lda_topics.items():
+    print(f"{topic}: {', '.join(words)}")
+
+# مقایسه Coherence
+print("\n" + "="*50)
+print("مقایسه نهایی (Semantic Coherence Score):")
+print("(امتیاز بالاتر نشان‌دهنده ارتباط معنایی قوی‌تر کلمات در یک موضوع است)")
+print("="*50)
+
+stm_score = calculate_semantic_coherence(dbscan_topics, stm_dbscan.model)
+lda_score = calculate_semantic_coherence(lda_topics, stm_dbscan.model)
+
+print(f"Paper Method (DBSCAN + UMAP) Score: {stm_score:.4f}")
+print(f"LDA Baseline Score: {lda_score:.4f}")
+
+if stm_score > lda_score:
+    print("\n✅ نتیجه: روش مقاله کلمات مرتبط‌تری را استخراج کرده است.")
+else:
+    print("\n❌ نتیجه: تفاوت معناداری مشاهده نشد (ممکن است به دلیل حجم کم داده باشد).")
+
+# رسم نمودار UMAP برای خوشه‌ها
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def plot_semantic_clusters(model_instance):
+
+    umap_2d = umap.UMAP(
+        n_neighbors=15,
+        n_components=2,
+        metric="cosine",
+        random_state=42
+    ).fit_transform(model_instance.doc_embeddings)
+
+    df_viz = pd.DataFrame({
+        'x': umap_2d[:, 0],
+        'y': umap_2d[:, 1],
+        'cluster': model_instance.labels
+    })
+
+    plt.figure(figsize=(12, 8))
+    sns.scatterplot(
+        data=df_viz,
+        x='x',
+        y='y',
+        hue='cluster',
+        palette='viridis',
+        s=100,
+        alpha=0.8
+    )
+
+    plt.title('Semantic Landscape of Documents (Transformer Embeddings)', fontsize=16)
+    plt.xlabel('UMAP-1', fontsize=12)
+    plt.ylabel('UMAP-2', fontsize=12)
+    plt.legend(title='Identified Topics', bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+# رسم نمودار
+print("Drawing the scatter plot...")
+plot_semantic_clusters(stm_dbscan)
